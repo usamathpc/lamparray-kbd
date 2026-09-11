@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore HID LampArray keyboard lighting
+# Started at login (default.target) and by udev whenever a LampArray device (re)enumerates,
+# e.g. after resume from suspend - firmware does not persist host-set colours.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/lamparray-kbd restore
+
+[Install]
+WantedBy=default.target

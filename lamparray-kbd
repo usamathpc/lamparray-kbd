@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""lamparray-kbd - per-key RGB control for any HID LampArray keyboard on Linux.
+
+Speaks the standard HID "Lighting and Illumination" protocol (usage page 0x59, HUT 1.5 §25,
+a.k.a. Windows Dynamic Lighting) directly over /dev/hidraw*. No dependencies beyond Python 3.
+First confirmed working on the Acer Predator Helios 16 PH16-72 keyboard (USB 05af:666a).
+"""
+import argparse, fcntl, glob, json, os, re, struct, subprocess, sys, time
+
+STATE = os.path.expanduser("~/.config/lamparray-kbd/state.json")
+UDEV_RULE = "/etc/udev/rules.d/70-lamparray-kbd.rules"
+SERVICE = "lamparray-kbd-restore.service"
+
+# LampArray top-level collection: Usage Page 0x59, Usage 0x01, Collection(Application)
+LAMPARRAY_MAGIC = b"\x05\x59\x09\x01\xa1\x01"
+# Report usages (HUT 1.5 §25) -> internal name
+U_ATTRS, U_ATTR_REQ, U_ATTR_RESP, U_MULTI, U_RANGE, U_CONTROL = 0x02, 0x20, 0x22, 0x50, 0x60, 0x70
+U_LAMP_ID = 0x21
+KINDS = {1: "keyboard", 2: "mouse", 3: "game-controller", 4: "peripheral", 5: "scene",
+         6: "notification", 7: "chassis", 8: "wearable", 9: "furniture", 10: "art"}
+
+# HID keyboard usage IDs -> friendly names (LampAttributes InputBinding)
+KEYNAMES = {0x28: "enter", 0x29: "esc", 0x2a: "backspace", 0x2b: "tab", 0x2c: "space",
+            0x2d: "minus", 0x2e: "equal", 0x2f: "lbracket", 0x30: "rbracket", 0x31: "backslash",
+            0x32: "hash", 0x33: "semicolon", 0x34: "quote", 0x35: "grave", 0x36: "comma",
+            0x37: "period", 0x38: "slash", 0x39: "capslock", 0x46: "printscreen",
+            0x47: "scrolllock", 0x48: "pause", 0x49: "insert", 0x4a: "home", 0x4b: "pageup",
+            0x4c: "delete", 0x4d: "end", 0x4e: "pagedown", 0x4f: "right", 0x50: "left",
+            0x51: "down", 0x52: "up", 0x53: "numlock", 0x54: "kpslash", 0x55: "kpasterisk",
+            0x56: "kpminus", 0x57: "kpplus", 0x58: "kpenter", 0x62: "kp0", 0x63: "kpdot",
+            0x64: "102nd", 0x65: "menu", 0x66: "power",
+            0xe0: "lctrl", 0xe1: "lshift", 0xe2: "lalt", 0xe3: "lmeta",
+            0xe4: "rctrl", 0xe5: "rshift", 0xe6: "ralt", 0xe7: "rmeta"}
+KEYNAMES.update({0x04 + i: chr(ord("a") + i) for i in range(26)})
+KEYNAMES.update({0x1e + i: str((i + 1) % 10) for i in range(10)})
+KEYNAMES.update({0x3a + i: f"f{i + 1}" for i in range(12)})
+KEYNAMES.update({0x68 + i: f"f{i + 13}" for i in range(12)})
+KEYNAMES.update({0x59 + i: f"kp{i + 1}" for i in range(9)})
+
+COLORS = {"red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255), "white": (255, 255, 255),
+          "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 255, 0),
+          "orange": (255, 80, 0), "purple": (128, 0, 255), "pink": (255, 40, 120),
+          "teal": (0, 160, 140), "off": (0, 0, 0), "black": (0, 0, 0)}
+
+
+def parse_color(s):
+    s = s.lower().lstrip("#")
+    if s in COLORS:
+        return COLORS[s]
+    if re.fullmatch(r"[0-9a-f]{6}", s):
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    if re.fullmatch(r"[0-9a-f]{3}", s):
+        return tuple(int(c * 2, 16) for c in s)
+    sys.exit(f"bad colour '{s}' (use rrggbb or one of {', '.join(COLORS)})")
+
+
+def parse_descriptor(desc):
+    """Walk a HID report descriptor and find the report ID of each LampArray report,
+    plus the number of lamp slots in LampMultiUpdate. Report IDs are device-chosen."""
+    i, page, usages, rid, rcount = 0, None, [], None, None
+    stack, cur, reports, slots = [], None, {}, None
+    while i < len(desc):
+        b = desc[i]; i += 1
+        if b == 0xFE:                                  # long item
+            i += 2 + desc[i]; continue
+        size = {0: 0, 1: 1, 2: 2, 3: 4}[b & 3]
+        tag = b & 0xFC
+        val = int.from_bytes(desc[i:i + size], "little"); i += size
+        if tag == 0x04:                                # Usage Page
+            page = val
+        elif tag == 0x08:                              # Usage
+            usages.append((val >> 16, val & 0xFFFF) if size == 4 else (page, val))
+        elif tag == 0x84:                              # Report ID
+            rid = val
+        elif tag == 0x94:                              # Report Count
+            rcount = val
+        elif tag == 0xA0:                              # Collection
+            u = usages[-1] if usages else None
+            stack.append(u); usages = []
+            if u and u[0] == 0x59 and u[1] in (U_ATTRS, U_ATTR_REQ, U_ATTR_RESP, U_MULTI, U_RANGE, U_CONTROL):
+                cur = u[1]
+        elif tag == 0xC0:                              # End Collection
+            u = stack.pop()
+            if u and u[0] == 0x59 and u[1] == cur:
+                cur = None
+        elif tag in (0x80, 0x90, 0xB0):                # Input / Output / Feature
+            if cur is not None:
+                reports.setdefault(cur, rid)
+                if cur == U_MULTI and (0x59, U_LAMP_ID) in usages:
+                    slots = rcount
+            usages = []
+    return reports, slots
+
+
+def discover():
+    devs = []
+    for h in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            uevent = open(h + "/device/uevent").read()
+            desc = open(h + "/device/report_descriptor", "rb").read()
+        except OSError:
+            continue
+        if LAMPARRAY_MAGIC not in desc:
+            continue
+        m = re.search(r"^HID_ID=\w+:(\w+):(\w+)$", uevent, re.M)
+        name = re.search(r"^HID_NAME=(.*)$", uevent, re.M)
+        reports, slots = parse_descriptor(desc)
+        if not all(u in reports for u in (U_ATTRS, U_ATTR_REQ, U_ATTR_RESP, U_MULTI, U_RANGE, U_CONTROL)):
+            continue
+        vid, pid = int(m.group(1), 16), int(m.group(2), 16)
+        devs.append(dict(path="/dev/" + os.path.basename(h), id=f"{vid:04x}:{pid:04x}",
+                         name=name.group(1) if name else "?", reports=reports, slots=slots or 8))
+    return devs
+
+
+def _ioc(d, nr, size):
+    return (d << 30) | (size << 16) | (ord("H") << 8) | nr
+
+
+class LampArray:
+    def __init__(self, dev, soft=False, retries=10):
+        self.dev, self.r = dev, dev["reports"]
+        # udev applies the uaccess ACL slightly after the node appears (and not at all while the
+        # session is inactive, e.g. when a keyboard re-enumerates on suspend entry) - retry briefly.
+        for i in range(retries):
+            try:
+                self.fd = os.open(dev["path"], os.O_RDWR); break
+            except PermissionError:
+                if i == retries - 1:
+                    print(f"no permission on {dev['path']} - run `sudo lamparray-kbd install-udev`", file=sys.stderr)
+                    sys.exit(0 if soft else 1)
+                time.sleep(0.5)
+        a = self.get(self.r[U_ATTRS], 23)
+        self.count, self.w, self.h, self.d, self.kind, self.min_interval = struct.unpack("<HIIIII", a[1:23])
+        self._lamps = None
+
+    def get(self, rid, n):
+        buf = bytearray(n); buf[0] = rid
+        fcntl.ioctl(self.fd, _ioc(3, 0x07, n), buf, True)
+        return bytes(buf)
+
+    def set(self, data):
+        fcntl.ioctl(self.fd, _ioc(3, 0x06, len(data)), bytearray(data), True)
+
+    def lamp_attrs(self, lid):
+        self.set(bytes([self.r[U_ATTR_REQ]]) + struct.pack("<H", lid))
+        resp = self.get(self.r[U_ATTR_RESP], 29)
+        rid, x, y, z, lat, purp, rl, gl, bl, il, prog, binding = struct.unpack("<HIIIIIBBBBBB", resp[1:29])
+        return dict(id=rid, x=x, y=y, z=z, latency=lat, purposes=purp, levels=(rl, gl, bl, il),
+                    programmable=prog, binding=binding, name=KEYNAMES.get(binding, f"lamp{rid}"))
+
+    def lamps(self):
+        if self._lamps is None:
+            self._lamps = [self.lamp_attrs(i) for i in range(self.count)]
+        return self._lamps
+
+    def autonomous(self, on):
+        self.set(bytes([self.r[U_CONTROL], 1 if on else 0]))
+
+    def fill(self, rgb):
+        self.autonomous(False)
+        self.set(bytes([self.r[U_RANGE], 1]) + struct.pack("<HH", 0, self.count - 1) + bytes(rgb) + b"\xff")
+
+    def multi(self, mapping):
+        """mapping: {lamp_id: (r,g,b)}; sends `slots` lamps per LampMultiUpdate report."""
+        self.autonomous(False)
+        items, n = sorted(mapping.items()), self.dev["slots"]
+        for i in range(0, len(items), n):
+            chunk = items[i:i + n]
+            last = i + n >= len(items)
+            ids = b"".join(struct.pack("<H", lid) for lid, _ in chunk) + b"\0\0" * (n - len(chunk))
+            cols = b"".join(bytes(c) + b"\xff" for _, c in chunk) + b"\0" * 4 * (n - len(chunk))
+            self.set(bytes([self.r[U_MULTI], len(chunk), 1 if last else 0]) + ids + cols)
+
+
+def scale(rgb, pct):
+    return tuple(min(255, round(c * pct / 100)) for c in rgb)
+
+
+def lerp(a, b, t):
+    return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(st, open(STATE, "w"), indent=1)
+
+
+def apply(kb, st):
+    mode, b = st["mode"], st.get("brightness", 100)
+    if mode == "auto":
+        kb.autonomous(True)
+    elif mode == "solid":
+        kb.fill(scale(st["color"], b))
+    elif mode == "gradient":
+        cols, n, m = st["colors"], len(st["colors"]) - 1, {}
+        for l in kb.lamps():
+            t = l["x"] / max(kb.w, 1) * n
+            i = min(int(t), n - 1)
+            m[l["id"]] = scale(lerp(cols[i], cols[i + 1], t - i), b)
+        kb.multi(m)
+    elif mode == "zones":
+        cols = st["colors"]
+        kb.multi({l["id"]: scale(cols[min(int(l["x"] / max(kb.w, 1) * len(cols)), len(cols) - 1)], b)
+                  for l in kb.lamps()})
+    elif mode == "keys":
+        base = scale(st["base"], b)
+        by_name = {l["name"]: l["id"] for l in kb.lamps()}
+        m = {i: base for i in range(kb.count)}
+        for k, c in st["keys"].items():
+            lid = by_name.get(k, int(k) if k.isdigit() else None)
+            if lid is None or lid >= kb.count:
+                print(f"warning: unknown key '{k}' (see `lamparray-kbd info`)", file=sys.stderr); continue
+            m[lid] = scale(c, b)
+        kb.multi(m)
+
+
+def udev_rule_text(devs):
+    lines = ["# HID LampArray devices - generated by `lamparray-kbd install-udev`.",
+             "# uaccess: let the logged-in user open the hidraw node; SYSTEMD_USER_WANTS: re-apply lighting",
+             "# whenever the device (re)enumerates, e.g. after resume from suspend."]
+    for d in devs:
+        vid, pid = d["id"].split(":")
+        lines.append(f'SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="{vid}", ATTRS{{idProduct}}=="{pid}", '
+                     f'TAG+="uaccess", TAG+="systemd", ENV{{SYSTEMD_USER_WANTS}}="{SERVICE}"')
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    p = argparse.ArgumentParser(prog="lamparray-kbd", description=__doc__.split("\n")[0],
+                                epilog="colours: rrggbb, rgb, or " + " ".join(COLORS))
+    p.add_argument("-d", "--device", metavar="VID:PID", help="select device (default: first found)")
+    p.add_argument("-b", "--brightness", type=int, metavar="PCT", help="0-100, default 100 (remembered)")
+    sp = p.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("list", help="list HID LampArray devices")
+    sp.add_parser("info", help="show device attributes and every lamp with its key name and position")
+    sp.add_parser("auto", help="hand control back to the device firmware (built-in effects)")
+    sp.add_parser("off", help="all lamps off")
+    sp.add_parser("restore", help="re-apply the last saved lighting to every present device (used by systemd)")
+    s = sp.add_parser("solid", help="one colour on every lamp"); s.add_argument("color")
+    s = sp.add_parser("gradient", help="left-to-right gradient through 2+ colours"); s.add_argument("colors", nargs="+")
+    s = sp.add_parser("zones", help="split the device into N left-to-right zones"); s.add_argument("colors", nargs="+")
+    s = sp.add_parser("keys", help="per-key colours over a base colour, e.g. keys 202020 w=red a=red s=red d=red")
+    s.add_argument("base"); s.add_argument("pairs", nargs="+", metavar="KEY=COLOR")
+    sp.add_parser("udev-rule", help="print a udev rule for the detected devices")
+    sp.add_parser("install-udev", help=f"write {UDEV_RULE} for the detected devices and reload udev (root)")
+    a = p.parse_args()
+
+    devs = discover()
+    if a.cmd == "list":
+        for d in devs:
+            print(f"{d['id']}  {d['path']:<14} {d['name']}  (reports {', '.join(f'{k:#04x}->{v:#04x}' for k, v in sorted(d['reports'].items()))}, {d['slots']} slots/multi-update)")
+        if not devs:
+            print("no HID LampArray devices found")
+        return
+    if a.cmd == "udev-rule":
+        sys.stdout.write(udev_rule_text(devs)); return
+    if a.cmd == "install-udev":
+        if os.geteuid() != 0:
+            sys.exit("install-udev must run as root")
+        if not devs:
+            sys.exit("no HID LampArray devices found")
+        open(UDEV_RULE, "w").write(udev_rule_text(devs))
+        subprocess.run(["udevadm", "control", "--reload-rules"], check=True)
+        subprocess.run(["udevadm", "trigger", "--subsystem-match=hidraw", "--action=add"], check=True)
+        print(f"wrote {UDEV_RULE} for: " + ", ".join(d["id"] for d in devs)); return
+    if a.cmd == "restore":
+        st = load_state().get("devices", {})
+        for d in devs:
+            if d["id"] in st:
+                apply(LampArray(d, soft=True), st[d["id"]])
+        return
+
+    if not devs:
+        sys.exit("no HID LampArray devices found (try `lamparray-kbd list` as root to rule out permissions)")
+    dev = next((d for d in devs if d["id"] == a.device), None) if a.device else devs[0]
+    if dev is None:
+        sys.exit(f"device {a.device} not found; run `lamparray-kbd list`")
+    kb = LampArray(dev)
+
+    if a.cmd == "info":
+        print(f"{dev['id']} {dev['name']} ({dev['path']}): kind={KINDS.get(kb.kind, kb.kind)} lamps={kb.count} "
+              f"size={kb.w/1000:.0f}x{kb.h/1000:.0f}x{kb.d/1000:.0f}mm min_update={kb.min_interval/1000:.0f}ms")
+        for l in kb.lamps():
+            print(f"{l['id']:3d}  {l['name']:<12} x={l['x']/1000:6.1f}mm y={l['y']/1000:5.1f}mm "
+                  f"levels=R{l['levels'][0]}/G{l['levels'][1]}/B{l['levels'][2]}/I{l['levels'][3]} "
+                  f"purposes={l['purposes']} latency={l['latency']}us")
+        return
+
+    state = load_state(); state.setdefault("devices", {})
+    prev = state["devices"].get(dev["id"], {})
+    st = {"brightness": a.brightness if a.brightness is not None else prev.get("brightness", 100)}
+    if a.cmd == "auto":
+        st["mode"] = "auto"
+    elif a.cmd == "off":
+        st.update(mode="solid", color=(0, 0, 0))
+    elif a.cmd == "solid":
+        st.update(mode="solid", color=parse_color(a.color))
+    elif a.cmd in ("gradient", "zones"):
+        st.update(mode=a.cmd, colors=[parse_color(c) for c in a.colors])
+    elif a.cmd == "keys":
+        st.update(mode="keys", base=parse_color(a.base),
+                  keys={k.lower(): parse_color(v) for k, v in (pair.split("=", 1) for pair in a.pairs)})
+    apply(kb, st)
+    state["devices"][dev["id"]] = st
+    save_state(state)
+
+
+if __name__ == "__main__":
+    main()
