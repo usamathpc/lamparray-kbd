@@ -73,7 +73,7 @@ lamparray-kbd auto                      # firmware effects again (Fn key usually
 lamparray-kbd -d 05af:666a solid red    # pick a device when several are present
 ```
 
-Colours: `rrggbb`, `rgb`, or `red green blue white cyan magenta yellow orange purple pink teal off`.
+Colours: `rrggbb`, `rgb`, or `red green blue white warmwhite coolwhite cyan magenta yellow orange purple pink teal off`.
 Key names: `a`–`z`, `0`–`9`, `f1`–`f24`, `esc space enter tab backspace lctrl lshift lalt lmeta
 rctrl … up down left right home end pageup pagedown insert delete kp0`–`kp9 kpenter` … (from the
 HID keycode each lamp reports), or a raw lamp number from `info`.
